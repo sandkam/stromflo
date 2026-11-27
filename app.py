@@ -306,7 +306,6 @@ def build_chord_figure(day_df: pd.DataFrame, target_date: pd.Timestamp, scale_ma
                 theta2=np.degrees(a0),
                 color=arc_cmap(i % 20),
                 lw=10.0,
-                solid_capstyle="butt",
             )
         )
 
