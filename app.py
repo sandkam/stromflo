@@ -1,6 +1,7 @@
+from datetime import datetime, timezone
 import json
-import time
 from pathlib import Path
+import time
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -11,381 +12,404 @@ import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Stromflo — European Cross-Border Flows", layout="wide")
+st.set_page_config(page_title="Stromflo", layout="wide")
 
 CBPF_URL = "https://api.energy-charts.info/cbpf"
-DEFAULT_COUNTRIES = [
-    "DE",
-    "FR",
-    "NL",
-    "BE",
-    "DK",
-    "AT",
-    "CH",
-    "CZ",
-    "PL",
-    "SE",
-    "NO",
-    "IT",
-    "ES",
-]
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_JSON_DIR = REPO_ROOT / "json_2019"
 
 
-def _parse_flow_series(payload: dict[str, Any]) -> pd.DataFrame:
-    """Parse an Energy-Charts /cbpf JSON payload into daily energy (GWh) rows.
+def _to_unix_seconds(date_str: str, end_of_day: bool = False) -> int:
+    """Convert a YYYY-MM-DD date string or integer string to UTC Unix seconds."""
+    cleaned = date_str.strip()
+    if cleaned.isdigit():
+        return int(cleaned)
+    dt = datetime.strptime(cleaned, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    if end_of_day:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return int(dt.timestamp())
 
-    API convention: positive values = imports into the target country;
-    negative values = exports from the target country.
-    """
+
+def _extract_country_from_filename(path: Path) -> str:
+    """Extract country code from filenames like cbpf_DE_2019.json or cbpf_de_2019.json."""
+    parts = path.stem.split("_")
+    if len(parts) >= 2 and len(parts[1]) in {2, 3}:
+        return parts[1].upper()
+    return "DE"
+
+
+def _series_to_daily_gwh(
+    series_vals: list[Any],
+    dt_index: pd.DatetimeIndex,
+    day_keys: pd.Index,
+    country: str,
+    partner: str,
+) -> list[dict[str, Any]]:
+    """Convert a power series (MW) into daily import and export energy (GWh)."""
+    if len(series_vals) != len(dt_index) or len(dt_index) == 0:
+        return []
+
+    s = pd.to_numeric(pd.Series(series_vals, index=dt_index), errors="coerce").fillna(0.0)
+    deltas_h = dt_index.to_series().diff().dt.total_seconds().div(3600.0).dropna()
+    dt_h = float(deltas_h.median()) if not deltas_h.empty and deltas_h.median() > 0 else 1.0
+
+    # Positive values = import into country; negative values = export from country
+    imp_gwh = s.clip(lower=0.0).mul(dt_h).div(1000.0).groupby(day_keys).sum()
+    exp_gwh = s.clip(upper=0.0).abs().mul(dt_h).div(1000.0).groupby(day_keys).sum()
+
+    rows: list[dict[str, Any]] = []
+    for d in imp_gwh.index:
+        rows.append(
+            {
+                "date": pd.Timestamp(d),
+                "country": country,
+                "partner": partner,
+                "import_gwh": float(imp_gwh.loc[d]),
+                "export_gwh": float(exp_gwh.loc[d]),
+            }
+        )
+    return rows
+
+
+def _parse_cbpf_payload(payload: Any, fallback_country: str = "DE") -> pd.DataFrame:
+    """Parse Energy-Charts /cbpf JSON payloads into daily import/export rows."""
+    if not isinstance(payload, dict):
+        return pd.DataFrame()
+
     timestamps = payload.get("unix_seconds") or payload.get("timestamps") or []
-    if not timestamps:
+    if not isinstance(timestamps, list) or not timestamps:
         return pd.DataFrame()
 
     dt_index = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("Europe/Berlin")
-    records: list[dict[str, Any]] = []
+    day_keys = pd.Index(dt_index.tz_localize(None).date)
 
-    # Support either {"countries": {code: {neighbor: [vals...]}}} or flat {neighbor: [vals...]}
-    source_map = payload.get("countries") if isinstance(payload.get("countries"), dict) else payload
-    if not isinstance(source_map, dict):
+    source = payload.get("countries") if isinstance(payload.get("countries"), dict) else payload
+    if not isinstance(source, dict):
         return pd.DataFrame()
 
-    for key, val in source_map.items():
-        if key in {"unix_seconds", "timestamps", "status", "license_info"}:
+    skip_keys = {"unix_seconds", "timestamps", "status", "license_info", "unit"}
+    rows: list[dict[str, Any]] = []
+
+    for key, val in source.items():
+        if key in skip_keys:
             continue
         if isinstance(val, dict):
-            # Nested mapping: target -> neighbor -> list of power values (MW)
-            target = str(key)
-            for neighbor, series in val.items():
-                if not isinstance(series, list) or len(series) != len(dt_index):
-                    continue
-                s = pd.to_numeric(pd.Series(series, index=dt_index), errors="coerce").fillna(0.0)
-                # Approximate step duration in hours from median timestamp delta
-                deltas_h = dt_index.to_series().diff().dt.total_seconds().div(3600.0).dropna()
-                dt_h = float(deltas_h.median()) if not deltas_h.empty and deltas_h.median() > 0 else 1.0
-
-                imp_gwh = s.clip(lower=0.0).mul(dt_h).div(1000.0).groupby(s.index.date).sum()
-                exp_gwh = s.clip(upper=0.0).abs().mul(dt_h).div(1000.0).groupby(s.index.date).sum()
-
-                for d in imp_gwh.index:
-                    records.append(
-                        {
-                            "date": pd.Timestamp(d),
-                            "country": target,
-                            "partner": str(neighbor),
-                            "import_gwh": float(imp_gwh.loc[d]),
-                            "export_gwh": float(exp_gwh.loc[d]),
-                        }
+            target = str(key).upper()
+            for neighbor, series_vals in val.items():
+                if isinstance(series_vals, list):
+                    rows.extend(
+                        _series_to_daily_gwh(
+                            series_vals=series_vals,
+                            dt_index=dt_index,
+                            day_keys=day_keys,
+                            country=target,
+                            partner=str(neighbor).upper(),
+                        )
                     )
-        elif isinstance(val, list) and len(val) == len(dt_index):
-            # Flat series for a single country (e.g., DE) where positive = import, negative = export
-            s = pd.to_numeric(pd.Series(val, index=dt_index), errors="coerce").fillna(0.0)
-            deltas_h = dt_index.to_series().diff().dt.total_seconds().div(3600.0).dropna()
-            dt_h = float(deltas_h.median()) if not deltas_h.empty and deltas_h.median() > 0 else 1.0
-
-            imp_gwh = s.clip(lower=0.0).mul(dt_h).div(1000.0).groupby(s.index.date).sum()
-            exp_gwh = s.clip(upper=0.0).abs().mul(dt_h).div(1000.0).groupby(s.index.date).sum()
-
-            for d in imp_gwh.index:
-                records.append(
-                    {
-                        "date": pd.Timestamp(d),
-                        "country": "DE",
-                        "partner": str(key),
-                        "import_gwh": float(imp_gwh.loc[d]),
-                        "export_gwh": float(exp_gwh.loc[d]),
-                    }
+        elif isinstance(val, list):
+            rows.extend(
+                _series_to_daily_gwh(
+                    series_vals=val,
+                    dt_index=dt_index,
+                    day_keys=day_keys,
+                    country=fallback_country.upper(),
+                    partner=str(key).upper(),
                 )
+            )
 
-    return pd.DataFrame(records)
+    return pd.DataFrame(rows)
 
 
-@st.cache_data(show_spinner="Loading flow data...")
-def load_flow_data(folder_str: str, pattern: str) -> pd.DataFrame:
-    """Load matching JSON files from disk and aggregate to daily import/export (GWh)."""
-    folder = Path(folder_str)
+@st.cache_data(show_spinner="Reading JSON files...")
+def load_json_folder(folder_path_str: str, glob_pattern: str) -> tuple[pd.DataFrame, list[str]]:
+    """Load JSON files from folder_path_str matching glob_pattern."""
+    folder = Path(folder_path_str)
     if not folder.exists() or not folder.is_dir():
-        return pd.DataFrame()
+        return pd.DataFrame(), [f"Folder does not exist: {folder}"]
 
-    files = sorted(folder.glob(pattern))
+    files = sorted(folder.glob(glob_pattern))
+    if not files:
+        files = sorted(folder.glob("*.json"))
+
+    if not files:
+        return pd.DataFrame(), [f"No JSON files found in {folder} matching '{glob_pattern}'."]
+
     frames: list[pd.DataFrame] = []
+    notes: list[str] = []
 
     for fp in files:
         try:
-            with fp.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-            parsed = _parse_flow_series(payload)
-            if not parsed.empty:
+            with fp.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+            parsed = _parse_cbpf_payload(payload, fallback_country=_extract_country_from_filename(fp))
+            if parsed.empty:
+                notes.append(f"Skipped {fp.name}: no valid flow series found.")
+            else:
                 frames.append(parsed)
-        except Exception:
-            continue
+        except Exception as exc:
+            notes.append(f"Skipped {fp.name}: {exc}")
 
     if not frames:
-        return pd.DataFrame()
+        return pd.DataFrame(), notes
 
-    combined = pd.concat(frames, ignore_index=True)
-    grouped = (
-        combined.groupby(["date", "country", "partner"], as_index=False)[["import_gwh", "export_gwh"]]
+    df = pd.concat(frames, ignore_index=True)
+    df = (
+        df.groupby(["date", "country", "partner"], as_index=False)[["import_gwh", "export_gwh"]]
         .sum()
         .sort_values(["date", "country", "partner"])
     )
-    return grouped
+    return df, notes
 
 
-@st.cache_data(show_spinner="Fetching sample data from Energy-Charts API...")
-def fetch_api_sample(country: str, start_iso: str, end_iso: str) -> pd.DataFrame:
-    """Fetch a date range from Energy-Charts /cbpf and convert to daily GWh."""
+@st.cache_data(show_spinner="Fetching Energy-Charts /cbpf data...")
+def fetch_cbpf_fallback(country: str, start_str: str, end_str: str) -> tuple[pd.DataFrame, str | None]:
+    """Optional API fallback when local JSON files are unavailable."""
     try:
         resp = requests.get(
             CBPF_URL,
-            params={"country": country.lower(), "start": start_iso, "end": end_iso},
-            timeout=15,
+            params={
+                "country": country.strip().lower(),
+                "start": _to_unix_seconds(start_str, end_of_day=False),
+                "end": _to_unix_seconds(end_str, end_of_day=True),
+            },
+            timeout=20,
         )
         resp.raise_for_status()
-        payload = resp.json()
-        df = _parse_flow_series(payload)
-        if not df.empty:
-            df["country"] = country.upper()
-        return df
-    except Exception:
-        return pd.DataFrame()
+        df = _parse_cbpf_payload(resp.json(), fallback_country=country.strip().upper())
+        if df.empty:
+            return pd.DataFrame(), "API response contained no parseable flow series."
+        return df, None
+    except Exception as exc:
+        return pd.DataFrame(), f"{type(exc).__name__}: {exc}"
 
 
-def _bezier_chord_patch(
-    start_angle: float,
-    end_angle: float,
+def _chord_patch(
+    a_start: float,
+    a_end: float,
     radius: float,
     color: Any,
     lw: float,
     alpha: float,
 ) -> PathPatch:
-    """Create a curved chord path between two angles on a circle of given radius."""
-    x0, y0 = radius * np.cos(start_angle), radius * np.sin(start_angle)
-    x1, y1 = radius * np.cos(end_angle), radius * np.sin(end_angle)
-    # Control point pulled inward toward center for chord curvature
-    cx, cy = 0.25 * (x0 + x1), 0.25 * (y0 + y1)
-
-    verts = [(x0, y0), (cx, cy), (x1, y1)]
-    codes = [MplPath.MOVETO, MplPath.CURVE3, MplPath.CURVE3]
-    path = MplPath(verts, codes)
+    """Quadratic Bezier chord connecting two angles around the circle."""
+    x0, y0 = radius * np.cos(a_start), radius * np.sin(a_start)
+    x1, y1 = radius * np.cos(a_end), radius * np.sin(a_end)
+    cx, cy = 0.2 * (x0 + x1), 0.2 * (y0 + y1)
+    path = MplPath([(x0, y0), (cx, cy), (x1, y1)], [MplPath.MOVETO, MplPath.CURVE3, MplPath.CURVE3])
     return PathPatch(path, facecolor="none", edgecolor=color, lw=lw, alpha=alpha, capstyle="round")
 
 
-def make_circle_figure(day_df: pd.DataFrame, selected_date: pd.Timestamp, max_ref: float) -> plt.Figure:
-    """Render circular chord diagram where arc size = gross flow and link = max(import, export)."""
-    fig, ax = plt.subplots(figsize=(7.2, 7.2), dpi=120)
+def build_chord_figure(day_df: pd.DataFrame, target_date: pd.Timestamp, scale_max_gwh: float) -> plt.Figure:
+    """Build circular diagram: arc size = gross flow (import + export), link = max(import, export)."""
+    fig, ax = plt.subplots(figsize=(7.0, 7.0), dpi=120)
     fig.patch.set_facecolor("#0e1117")
     ax.set_facecolor("#0e1117")
     ax.set_aspect("equal")
     ax.axis("off")
 
     if day_df.empty:
-        ax.text(0, 0, f"No flow data for {selected_date.strftime('%Y-%m-%d')}", color="white", ha="center", va="center")
+        ax.text(0, 0, f"No data for {target_date.strftime('%Y-%m-%d')}", color="white", ha="center", va="center")
         return fig
 
     work = day_df.copy()
     work["gross_gwh"] = work["import_gwh"] + work["export_gwh"]
-    work["max_flow_gwh"] = np.maximum(work["import_gwh"], work["export_gwh"])
+    work["max_gwh"] = np.maximum(work["import_gwh"], work["export_gwh"])
 
     nodes = sorted(set(work["country"]).union(set(work["partner"])))
-    gross_by_node: dict[str, float] = {}
-    for node in nodes:
-        g_main = work.loc[work["country"] == node, "gross_gwh"].sum()
-        g_part = work.loc[work["partner"] == node, "gross_gwh"].sum()
-        gross_by_node[node] = float(g_main + g_part)
+    gross_map: dict[str, float] = {}
+    for n in nodes:
+        g = work.loc[work["country"] == n, "gross_gwh"].sum() + work.loc[work["partner"] == n, "gross_gwh"].sum()
+        gross_map[n] = float(g)
 
-    total_gross = sum(gross_by_node.values())
+    total_gross = sum(gross_map.values())
     if total_gross <= 0:
         total_gross = float(len(nodes))
-        gross_by_node = {n: 1.0 for n in nodes}
+        gross_map = {n: 1.0 for n in nodes}
 
     radius = 1.0
-    gap_rad = 0.03
-    usable_span = max(2.0 * np.pi - gap_rad * len(nodes), np.pi)
-
-    node_angles: dict[str, tuple[float, float]] = {}
+    gap = 0.03
+    avail_span = max(2.0 * np.pi - gap * len(nodes), np.pi)
     cur = np.pi / 2.0
-    cmap = plt.cm.tab20
+    angles: dict[str, tuple[float, float]] = {}
+    arc_cmap = plt.cm.tab20
 
-    for idx, node in enumerate(nodes):
-        span = (gross_by_node[node] / total_gross) * usable_span
-        a0 = cur
-        a1 = cur - span
-        node_angles[node] = (a0, a1)
+    for i, node in enumerate(nodes):
+        span = (gross_map[node] / total_gross) * avail_span
+        a0, a1 = cur, cur - span
+        angles[node] = (a0, a1)
 
-        # Draw outer arc proportional to gross flow (import + export)
-        deg0, deg1 = np.degrees(a1), np.degrees(a0)
-        arc = Arc(
-            (0, 0),
-            width=2.0 * radius,
-            height=2.0 * radius,
-            angle=0.0,
-            theta1=deg0,
-            theta2=deg1,
-            color=cmap(idx % 20),
-            lw=10.0,
-            solid_capstyle="butt",
+        ax.add_patch(
+            Arc(
+                (0, 0),
+                width=2.0 * radius,
+                height=2.0 * radius,
+                angle=0.0,
+                theta1=np.degrees(a1),
+                theta2=np.degrees(a0),
+                color=arc_cmap(i % 20),
+                lw=10.0,
+                solid_capstyle="butt",
+            )
         )
-        ax.add_patch(arc)
 
         mid = 0.5 * (a0 + a1)
-        lx, ly = 1.13 * radius * np.cos(mid), 1.13 * radius * np.sin(mid)
         ax.text(
-            lx,
-            ly,
-            f"{node}\n({gross_by_node[node]:.1f})",
+            1.14 * radius * np.cos(mid),
+            1.14 * radius * np.sin(mid),
+            f"{node}\n{gross_map[node]:.1f} GWh",
             color="#f0f2f6",
-            fontsize=8.5,
+            fontsize=8.2,
             fontweight="bold",
             ha="center",
             va="center",
         )
-        cur = a1 - gap_rad
+        cur = a1 - gap
 
-    # Draw links sized and colored by max(import, export)
+    denom = max(scale_max_gwh, float(work["max_gwh"].max()), 1e-6)
     link_cmap = plt.cm.plasma
-    denom = max(max_ref, float(work["max_flow_gwh"].max()), 1e-6)
 
     for _, row in work.iterrows():
         u, v = row["country"], row["partner"]
-        if u not in node_angles or v not in node_angles or u == v:
+        if u not in angles or v not in angles or u == v:
             continue
-        intensity = float(np.clip(row["max_flow_gwh"] / denom, 0.0, 1.0))
-        if intensity <= 0.01:
+        strength = float(np.clip(row["max_gwh"] / denom, 0.0, 1.0))
+        if strength <= 0.01:
             continue
 
-        u_mid = 0.5 * (node_angles[u][0] + node_angles[u][1])
-        v_mid = 0.5 * (node_angles[v][0] + node_angles[v][1])
-
-        patch = _bezier_chord_patch(
-            start_angle=u_mid,
-            end_angle=v_mid,
-            radius=radius * 0.96,
-            color=link_cmap(intensity),
-            lw=0.8 + 6.5 * intensity,
-            alpha=0.25 + 0.65 * intensity,
+        u_mid = 0.5 * (angles[u][0] + angles[u][1])
+        v_mid = 0.5 * (angles[v][0] + angles[v][1])
+        ax.add_patch(
+            _chord_patch(
+                a_start=u_mid,
+                a_end=v_mid,
+                radius=radius * 0.96,
+                color=link_cmap(strength),
+                lw=0.8 + 6.5 * strength,
+                alpha=0.25 + 0.65 * strength,
+            )
         )
-        ax.add_patch(patch)
 
-    ax.set_xlim(-1.35, 1.35)
-    ax.set_ylim(-1.35, 1.35)
+    ax.set_xlim(-1.38, 1.38)
+    ax.set_ylim(-1.38, 1.38)
     ax.set_title(
-        f"Cross-Border Electricity Flows — {selected_date.strftime('%Y-%m-%d')} (Arc = Gross GWh, Link = Max GWh)",
+        f"{target_date.strftime('%Y-%m-%d')} — Arc: Gross Flow (GWh) | Link: Max(Import, Export) (GWh)",
         color="#f0f2f6",
-        fontsize=11,
+        fontsize=10.5,
         pad=14,
     )
     fig.tight_layout()
     return fig
 
 
-def render_playback_controls(num_dates: int) -> tuple[int, float]:
-    """Render Play/Pause, Step +1, step size, and delay controls."""
-    st.session_state.setdefault("is_playing", False)
-    st.session_state.setdefault("date_idx", 0)
+def render_controls(num_dates: int) -> tuple[int, float]:
+    """Render Play/Pause, Step +1, Days/frame, and delay slider."""
+    st.session_state.setdefault("playing", False)
+    st.session_state.setdefault("idx", 0)
 
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        if st.button("Play" if not st.session_state.is_playing else "Pause", use_container_width=True):
-            st.session_state.is_playing = not st.session_state.is_playing
+    b1, b2, b3 = st.columns([1, 1, 2])
+    with b1:
+        label = "Pause" if st.session_state.playing else "Play"
+        if st.button(label, use_container_width=True):
+            st.session_state.playing = not st.session_state.playing
             st.rerun()
 
-    with c2:
+    with b2:
         if st.button("Step +1", use_container_width=True):
-            st.session_state.is_playing = False
-            st.session_state.date_idx = (int(st.session_state.date_idx) + 1) % max(num_dates, 1)
+            st.session_state.playing = False
+            st.session_state.idx = (int(st.session_state.idx) + 1) % max(num_dates, 1)
 
-    with c3:
-        step_days = st.number_input("Days / frame", min_value=1, max_value=30, value=1, step=1)
+    with b3:
+        step_days = st.number_input("Days per frame", min_value=1, max_value=30, value=1, step=1)
 
-    delay_sec = st.slider("Frame delay (sec)", min_value=0.05, max_value=1.0, value=0.2, step=0.05)
+    delay_sec = st.slider("Frame delay (seconds)", min_value=0.05, max_value=1.0, value=0.2, step=0.05)
     return int(step_days), float(delay_sec)
 
 
 @st.fragment
-def animated_circle_view(df: pd.DataFrame, dates: list[Any], step_days: int, delay_sec: float, max_ref: float) -> None:
-    """Update date readout, slider, and circular plot smoothly during playback."""
-    info_placeholder = st.empty()
-    plot_placeholder = st.empty()
+def run_animated_plot(
+    df: pd.DataFrame,
+    dates: list[Any],
+    step_days: int,
+    delay_sec: float,
+    scale_max_gwh: float,
+) -> None:
+    """Fragment loop updating the date slider, summary, and circular diagram."""
+    status_box = st.empty()
+    chart_box = st.empty()
 
     while True:
-        idx = int(st.session_state.date_idx) % len(dates)
-        st.session_state.date_idx = idx
-        selected_date = pd.Timestamp(dates[idx])
+        idx = int(st.session_state.idx) % len(dates)
+        st.session_state.idx = idx
+        current_date = pd.Timestamp(dates[idx])
 
-        slider_val = st.slider(
-            "Scrub date",
+        picked_idx = st.slider(
+            "Date",
             min_value=0,
             max_value=len(dates) - 1,
             value=idx,
-            key="stromflo_date_slider",
+            key="chord_date_slider",
         )
-        if slider_val != idx:
-            st.session_state.date_idx = int(slider_val)
-            st.session_state.is_playing = False
-            idx = int(st.session_state.date_idx)
-            selected_date = pd.Timestamp(dates[idx])
+        if picked_idx != idx:
+            st.session_state.idx = int(picked_idx)
+            st.session_state.playing = False
+            idx = int(st.session_state.idx)
+            current_date = pd.Timestamp(dates[idx])
 
-        day_df = df[df["date"] == selected_date]
-        gross_total = float((day_df["import_gwh"] + day_df["export_gwh"]).sum()) if not day_df.empty else 0.0
+        day_df = df[df["date"] == current_date]
+        gross_gwh = float((day_df["import_gwh"] + day_df["export_gwh"]).sum()) if not day_df.empty else 0.0
+        max_link_gwh = float(np.maximum(day_df["import_gwh"], day_df["export_gwh"]).max()) if not day_df.empty else 0.0
 
-        info_placeholder.markdown(
-            f"**Date:** `{selected_date.strftime('%Y-%m-%d')}` ({idx + 1} / {len(dates)}) "
-            f"| **Daily Gross Flow:** `{gross_total:,.1f} GWh`"
+        status_box.markdown(
+            f"**Date:** `{current_date.strftime('%Y-%m-%d')}` ({idx + 1}/{len(dates)}) "
+            f"| **Gross Flow:** `{gross_gwh:,.1f} GWh` "
+            f"| **Peak Link:** `{max_link_gwh:,.1f} GWh`"
         )
 
-        fig = make_circle_figure(day_df, selected_date, max_ref=max_ref)
-        with plot_placeholder.container():
+        fig = build_chord_figure(day_df, current_date, scale_max_gwh=scale_max_gwh)
+        with chart_box.container():
             st.pyplot(fig, clear_figure=True)
         plt.close(fig)
 
-        if not st.session_state.is_playing:
+        if not st.session_state.playing:
             break
 
         time.sleep(delay_sec)
-        st.session_state.date_idx = (idx + step_days) % len(dates)
+        st.session_state.idx = (idx + step_days) % len(dates)
 
 
 def main() -> None:
     st.title("Stromflo — European Cross-Border Electricity Flows")
 
-    repo_root = Path(__file__).resolve().parent
-    default_dir = (
-        repo_root / "json_2019"
-        if (repo_root / "json_2019").exists()
-        else repo_root / "sample_json_2019"
-    )
-
     with st.sidebar:
-        st.header("Data Source")
-        folder_input = st.text_input("JSON folder", value=str(default_dir))
-        pattern_input = st.text_input("Filename glob", value="cbpf_*_2019.json")
+        st.header("Data")
+        folder_str = st.text_input("JSON directory", value=str(DEFAULT_JSON_DIR))
+        glob_pattern = st.text_input("File pattern", value="cbpf_*_2019.json")
 
         st.divider()
-        st.caption("Fallback if no local JSON files match:")
-        api_country = st.selectbox("API country", options=DEFAULT_COUNTRIES, index=0)
-        api_start = st.text_input("Start date (YYYY-MM-DD)", value="2019-01-01")
-        api_end = st.text_input("End date (YYYY-MM-DD)", value="2019-01-31")
-        use_api_fallback = st.checkbox("Use Energy-Charts API fallback", value=True)
+        use_fallback = st.checkbox("Fallback to Energy-Charts API if empty", value=True)
+        fb_country = st.text_input("Fallback country", value="DE")
+        fb_start = st.text_input("Fallback start (YYYY-MM-DD)", value="2019-01-01")
+        fb_end = st.text_input("Fallback end (YYYY-MM-DD)", value="2019-01-31")
 
-    # --- Insert here: replaces the old load_flow_data / fetch_api_sample / if df.empty block ---
-    api_error: str | None = None
-    df = load_flow_data(folder_input, pattern_input)
+    df, parse_notes = load_json_folder(folder_str, glob_pattern)
+    api_err: str | None = None
 
-    if df.empty and use_api_fallback:
-        df, api_error = fetch_api_sample(api_country, api_start, api_end)
+    if df.empty and use_fallback:
+        df, api_err = fetch_cbpf_fallback(fb_country, fb_start, fb_end)
 
     if df.empty:
-        st.warning(f"No valid JSON files found matching `{pattern_input}` in `{folder_input}`.")
-        if api_error:
-            st.error(f"API fallback error: {api_error}")
+        st.warning("No flow data loaded.")
+        for note in parse_notes:
+            st.caption(note)
+        if api_err:
+            st.error(f"API fallback error: {api_err}")
         st.stop()
-    # --- End of replacement block ---
 
     dates = sorted(df["date"].unique())
-    max_ref = float(np.maximum(df["import_gwh"], df["export_gwh"]).quantile(0.98))
+    scale_max_gwh = float(np.maximum(df["import_gwh"], df["export_gwh"]).quantile(0.98))
 
-    step_days, delay_sec = render_playback_controls(len(dates))
-    animated_circle_view(df, dates, step_days, delay_sec, max_ref=max_ref)
+    step_days, delay_sec = render_controls(len(dates))
+    run_animated_plot(df, dates, step_days, delay_sec, scale_max_gwh=scale_max_gwh)
 
 
 if __name__ == "__main__":
