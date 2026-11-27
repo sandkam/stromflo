@@ -1,9 +1,9 @@
 """Fraunhofer-style electricity flow circle for Germany and its 11 neighbours.
 
-Design (kept from the original app)
+Design
   * One arc per country; arc length = share of the day's gross flow (import + export).
   * One ribbon per border; width = its gross flow, colour = the net exporting country.
-  * A day slider and auto-play step through the year.
+  * Play/Pause and Step +1 buttons, a day slider, and auto-play step through the year.
 
 Data: Energy-Charts "cbpf" JSON files, one per country, e.g. json_2019/cbpf_de_2019.json.
 Each file holds `unix_seconds` and a `countries` list of {name, data} where `data` is
@@ -12,23 +12,32 @@ power in GW (positive = import into the file's country).
 from __future__ import annotations
 
 import json
-import time
 from pathlib import Path
+import time
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import PathPatch, Wedge
+from matplotlib.path import Path as MplPath
 import numpy as np
 import pandas as pd
 import streamlit as st
-from matplotlib.patches import PathPatch, Wedge
-from matplotlib.path import Path as MplPath
 
 st.set_page_config(page_title="Germany electricity flow circle", layout="wide")
 
 # Clockwise order around the circle, starting at the top. Germany closes the ring.
 NODES = {
-    "NO": "Norway", "SE": "Sweden", "DK": "Denmark", "PL": "Poland",
-    "CZ": "Czechia", "AT": "Austria", "CH": "Switzerland", "FR": "France",
-    "LU": "Luxembourg", "BE": "Belgium", "NL": "Netherlands", "DE": "Germany",
+    "NO": "Norway",
+    "SE": "Sweden",
+    "DK": "Denmark",
+    "PL": "Poland",
+    "CZ": "Czechia",
+    "AT": "Austria",
+    "CH": "Switzerland",
+    "FR": "France",
+    "LU": "Luxembourg",
+    "BE": "Belgium",
+    "NL": "Netherlands",
+    "DE": "Germany",
 }
 NAME_TO_CODE = {name.lower(): code for code, name in NODES.items()}
 NAME_TO_CODE["czech republic"] = "CZ"
@@ -67,10 +76,12 @@ def parse_file(path: Path, country: str) -> list[pd.DataFrame]:
             continue
         energy = pd.Series(power * step_h, index=days)
         # Import / export are summed from the positive / negative intervals of each day.
-        daily = pd.DataFrame({
-            "import_gwh": energy.clip(lower=0).groupby(level=0).sum(),
-            "export_gwh": (-energy).clip(lower=0).groupby(level=0).sum(),
-        })
+        daily = pd.DataFrame(
+            {
+                "import_gwh": energy.clip(lower=0).groupby(level=0).sum(),
+                "export_gwh": (-energy).clip(lower=0).groupby(level=0).sum(),
+            }
+        )
         frames.append(daily.rename_axis("date").reset_index().assign(country=country, partner=partner))
     return frames
 
@@ -249,6 +260,34 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp) -> plt.Figure:
     return fig
 
 
+# ------------------------------------------------------------------ playback
+def render_day_controls(num_days: int) -> None:
+    """Render Play/Pause and Step +1 buttons and advance day_idx when playing."""
+    st.session_state.setdefault("playing", False)
+    st.session_state.setdefault("day_idx", 0)
+    st.session_state["day_idx"] = min(int(st.session_state["day_idx"]), max(num_days - 1, 0))
+
+    if st.session_state.pop("advance", False) and num_days > 0:
+        st.session_state["day_idx"] = (int(st.session_state["day_idx"]) + 1) % num_days
+
+    col_play, col_step, col_status = st.columns([1.2, 1.2, 3.6])
+    with col_play:
+        btn_label = "Pause" if st.session_state["playing"] else "Play"
+        if st.button(btn_label, use_container_width=True):
+            st.session_state["playing"] = not st.session_state["playing"]
+            st.rerun()
+
+    with col_step:
+        if st.button("Step +1", use_container_width=True) and num_days > 0:
+            st.session_state["playing"] = False
+            st.session_state["day_idx"] = (int(st.session_state["day_idx"]) + 1) % num_days
+            st.rerun()
+
+    with col_status:
+        state_text = "Playing" if st.session_state["playing"] else "Paused"
+        st.caption(f"Status: {state_text}")
+
+
 # --------------------------------------------------------------------------- app
 def main() -> None:
     st.title("Germany's cross-border electricity flows")
@@ -258,7 +297,6 @@ def main() -> None:
         year = int(st.number_input("Year", min_value=2000, max_value=2100, value=2019, step=1))
         folder = st.text_input("JSON folder", value=f"json_{year}", key=f"folder_{year}")
         neighbours = st.checkbox("Include links between neighbours", value=True)
-        st.checkbox("Auto-play", key="playing")
         delay = st.slider("Step delay (s)", 0.05, 1.0, 0.2, 0.05)
 
     df, missing = load_flows(folder, year)
@@ -272,16 +310,15 @@ def main() -> None:
     dates = np.sort(links_all["date"].unique())
     n = len(dates)
 
-    st.session_state.setdefault("day_idx", 0)
-    st.session_state.day_idx = min(st.session_state.day_idx, n - 1)
-    if st.session_state.pop("advance", False):  # set at the end of the previous run
-        st.session_state.day_idx = (st.session_state.day_idx + 1) % n
+    render_day_controls(n)
     idx = st.slider("Day of year", 0, n - 1, key="day_idx")
 
     date = pd.Timestamp(dates[idx])
     st.subheader(f"{date:%A, %d %B %Y}")
-    st.caption("Arc length and ribbon width show gross flow (import + export). "
-               "Ribbon colour is the net exporting country on that border.")
+    st.caption(
+        "Arc length and ribbon width show gross flow (import + export). "
+        "Ribbon colour is the net exporting country on that border."
+    )
     day = links_all[links_all["date"] == date]
     de = df[(df["date"] == date) & (df["country"] == "DE")]
 
@@ -301,15 +338,17 @@ def main() -> None:
             c1.metric("Import", f"{imp:,.0f}")
             c2.metric("Export", f"{exp:,.0f}")
             c3.metric("Net", f"{imp - exp:+,.0f}")
-            table = pd.DataFrame({
-                "Neighbour": de["partner"].map(NODES),
-                "Import": de["import_gwh"],
-                "Export": de["export_gwh"],
-                "Net": de["import_gwh"] - de["export_gwh"],
-            }).sort_values("Import", ascending=False)
+            table = pd.DataFrame(
+                {
+                    "Neighbour": de["partner"].map(NODES),
+                    "Import": de["import_gwh"],
+                    "Export": de["export_gwh"],
+                    "Net": de["import_gwh"] - de["export_gwh"],
+                }
+            ).sort_values("Import", ascending=False)
             st.dataframe(table.round(1), hide_index=True)
 
-    if st.session_state.get("playing"):
+    if st.session_state.get("playing") and n > 0:
         time.sleep(delay)
         st.session_state["advance"] = True
         st.rerun()
