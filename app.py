@@ -96,7 +96,7 @@ def load_flows(folder: str, year: int) -> tuple[pd.DataFrame, list[str]]:
 
 
 # ------------------------------------------------------------------------- figure
-RING_INNER, RING_OUTER = 0.955, 1.0
+RING_INNER, RING_OUTER = 0.945, 1.0
 CENTER = np.zeros(2)
 
 
@@ -107,16 +107,29 @@ def point(cw_deg: float, radius: float) -> np.ndarray:
 
 
 def ribbon_path(slot_a: tuple[float, float], slot_b: tuple[float, float]) -> MplPath:
-    """Closed chord ribbon: arc along A, curve to B, arc along B, curve back to A."""
+    """Closed chord ribbon: arc along A, quadratic curve to B, arc along B, curve back to A."""
     def arc(s0: float, s1: float) -> list[np.ndarray]:
         steps = max(2, int(abs(s1 - s0) / 1.5) + 2)
         return [point(t, RING_INNER) for t in np.linspace(s0, s1, steps)]
 
     pa, pb = arc(*slot_a), arc(*slot_b)
-    verts = pa + [CENTER, pb[0]] + pb[1:] + [CENTER, pa[0], pa[0]]
-    codes = ([MplPath.MOVETO] + [MplPath.LINETO] * (len(pa) - 1)
-             + [MplPath.CURVE3] * 2 + [MplPath.LINETO] * (len(pb) - 1)
-             + [MplPath.CURVE3] * 2 + [MplPath.CLOSEPOLY])
+    # Pull quadratic Bezier control point slightly toward the center for natural chord curve
+    ctrl_ab = 0.22 * (pa[-1] + pb[0])
+    ctrl_ba = 0.22 * (pb[-1] + pa[0])
+
+    verts = (
+        pa
+        + [ctrl_ab, pb[0]]
+        + pb[1:]
+        + [ctrl_ba, pa[0], pa[0]]
+    )
+    codes = (
+        [MplPath.MOVETO]
+        + [MplPath.LINETO] * (len(pa) - 1)
+        + [MplPath.CURVE3, MplPath.LINETO]
+        + [MplPath.LINETO] * (len(pb) - 1)
+        + [MplPath.CURVE3, MplPath.LINETO, MplPath.CLOSEPOLY]
+    )
     return MplPath(verts, codes)
 
 
@@ -128,17 +141,41 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp) -> plt.Figure:
         gross[r.partner] += r.gross_gwh
     total = sum(gross.values())
 
-    fig, ax = plt.subplots(figsize=(7.5, 7.5), dpi=110)
+    bg = "#0e1117"
+    fg = "#f0f2f6"
+    fig, ax = plt.subplots(figsize=(7.6, 7.6), dpi=120)
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_xlim(-1.25, 1.25)
-    ax.set_ylim(-1.25, 1.25)
-    ax.set_title(f"Electricity flow circle - {date:%Y-%m-%d}", fontsize=12)
+    ax.set_xlim(-1.32, 1.32)
+    ax.set_ylim(-1.32, 1.32)
+    ax.set_title(
+        f"Electricity Flow Circle — {date:%Y-%m-%d}",
+        fontsize=12.5,
+        fontweight="bold",
+        color=fg,
+        pad=14,
+    )
+
     if total <= 0:
-        ax.text(0, 0, "No flow data for this day", ha="center", va="center")
+        ax.text(0, 0, "No flow data for this day", ha="center", va="center", color="#9aa4b2", fontsize=11)
+        fig.tight_layout()
         return fig
 
-    # Arc layout (degrees clockwise from the top). A small floor keeps idle nodes visible.
+    # Subtle inner track guide
+    ax.add_patch(
+        plt.Circle(
+            (0, 0),
+            RING_INNER,
+            fill=False,
+            edgecolor=(1.0, 1.0, 1.0, 0.08),
+            linewidth=0.8,
+            linestyle="--",
+        )
+    )
+
+    # Arc layout (degrees clockwise from the top). Small floor keeps idle nodes visible.
     weight = {c: g + 0.004 * total for c, g in gross.items()}
     usable = 360.0 - GAP_DEG * len(NODES)
     arcs, cursor = {}, 0.0
@@ -147,14 +184,18 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp) -> plt.Figure:
         arcs[c] = (cursor, cursor + span)
         cursor += span + GAP_DEG
     mid = {c: (a + b) / 2 for c, (a, b) in arcs.items()}
-    color = {c: plt.cm.Paired(i) for i, c in enumerate(NODES)}
+    palette = [plt.cm.tab20(i % 20) for i in range(len(NODES))]
+    color = {c: palette[i] for i, c in enumerate(NODES)}
 
     # Each link gets a slot inside both of its arcs. Ordering partners by clockwise
     # distance (farthest first) keeps the ribbons of one node from crossing each other.
     slots = {}
     for c, (a, b) in arcs.items():
-        mine = [(r.partner if r.country == c else r.country, r.gross_gwh)
-                for r in links.itertuples() if c in (r.country, r.partner)]
+        mine = [
+            (r.partner if r.country == c else r.country, r.gross_gwh)
+            for r in links.itertuples()
+            if c in (r.country, r.partner)
+        ]
         mine.sort(key=lambda x: -((mid[x[0]] - mid[c]) % 360.0))
         node_total = sum(w for _, w in mine) or 1.0
         pos = a
@@ -163,18 +204,48 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp) -> plt.Figure:
             slots[(c, partner)] = (pos, pos + span)
             pos += span
 
+    # Draw outer country arcs and labels
     for c, (a, b) in arcs.items():
-        ax.add_patch(Wedge((0, 0), RING_OUTER, 90 - b, 90 - a, width=RING_OUTER - RING_INNER,
-                           facecolor=color[c][:3] + (0.55,), edgecolor="none"))
-        x, y = point(mid[c], 1.1)
-        ax.text(x, y, c, ha="center", va="center", fontsize=10, fontweight="bold")
+        ax.add_patch(
+            Wedge(
+                (0, 0),
+                RING_OUTER,
+                90 - b,
+                90 - a,
+                width=RING_OUTER - RING_INNER,
+                facecolor=color[c][:3] + (0.88,),
+                edgecolor=bg,
+                linewidth=1.0,
+            )
+        )
+        lx, ly = point(mid[c], 1.13)
+        ax.text(
+            lx,
+            ly,
+            f"{c}\n{gross[c]:,.0f}",
+            ha="center",
+            va="center",
+            fontsize=8.8,
+            fontweight="bold",
+            color=fg,
+            linespacing=1.15,
+        )
 
-    # Ribbon colour = the border's net exporting country (positive = import into `country`).
+    # Draw ribbons largest-first so smaller border flows stay visible on top
     for r in links.sort_values("gross_gwh", ascending=False).itertuples():
+        if r.gross_gwh <= 0:
+            continue
         exporter = r.partner if r.import_gwh >= r.export_gwh else r.country
-        ax.add_patch(PathPatch(ribbon_path(slots[(r.country, r.partner)], slots[(r.partner, r.country)]),
-                               facecolor=color[exporter][:3] + (0.8,),
-                               edgecolor=(0, 0, 0, 0.25), linewidth=0.4))
+        ax.add_patch(
+            PathPatch(
+                ribbon_path(slots[(r.country, r.partner)], slots[(r.partner, r.country)]),
+                facecolor=color[exporter][:3] + (0.72,),
+                edgecolor=(0.05, 0.07, 0.10, 0.35),
+                linewidth=0.5,
+            )
+        )
+
+    fig.tight_layout()
     return fig
 
 
