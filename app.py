@@ -2,7 +2,8 @@
 
 Design (kept from the original app)
   * One arc per country; arc length = share of the day's gross flow (import + export).
-  * One curved link per border; link width and colour = the larger of import / export.
+  * One curved link per border; width = its share of the day's total flow,
+    colour = the larger of import / export.
   * A day slider and auto-play step through the year.
 
 Data: Energy-Charts "cbpf" JSON files, one per country, e.g. json_2019/cbpf_de_2019.json.
@@ -35,6 +36,7 @@ NODES = {
 NAME_TO_CODE = {name.lower(): code for code, name in NODES.items()}
 NAME_TO_CODE["czech republic"] = "CZ"
 GAP_DEG = 2.0
+LINK_WIDTH_PER_SHARE = 60.0  # line width (pt) per 100% share of the day's flow
 TIMEZONE = "Europe/Berlin"
 
 
@@ -148,8 +150,7 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp, max_ref: float) 
         ax.add_patch(Arc((0, 0), 2, 2, theta1=90 - b, theta2=90 - a, linewidth=10,
                          color="#2b2d42" if c == "DE" else plt.cm.tab20(i % 20)))
         x, y = point(mid[c], 1.15)
-        ax.text(x, y, f"{c}\n{gross[c] / total * 100:.1f}%", ha="center", va="center",
-                fontsize=8.5, fontweight="bold")
+        ax.text(x, y, c, ha="center", va="center", fontsize=10, fontweight="bold")
 
     cmap = plt.cm.viridis
     for r in links.sort_values("max_gwh").itertuples():  # strongest links drawn last
@@ -157,9 +158,10 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp, max_ref: float) 
         p2 = point(attach[(r.partner, r.country)], 0.94)
         ctrl = 0.12 * (p1 + p2)
         strength = float(np.clip(r.max_gwh / max_ref, 0.0, 1.0))
+        share = r.gross_gwh / (total / 2.0)  # this border's share of the day's total flow
         path = MplPath([p1, ctrl, p2], [MplPath.MOVETO, MplPath.CURVE3, MplPath.CURVE3])
         ax.add_patch(PathPatch(path, facecolor="none", edgecolor=cmap(strength),
-                               linewidth=0.7 + 5.5 * strength ** 0.7, alpha=0.75))
+                               linewidth=0.6 + LINK_WIDTH_PER_SHARE * share, alpha=0.75))
 
     fig.colorbar(ScalarMappable(Normalize(0, max_ref), cmap=cmap), ax=ax, fraction=0.035,
                  pad=0.02, label="Larger of import / export per day (GWh)")
