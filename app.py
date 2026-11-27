@@ -18,6 +18,16 @@ CBPF_URL = "https://api.energy-charts.info/cbpf"
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_JSON_DIR = REPO_ROOT / "json_2019"
 
+META_KEYS = {
+    "unix_seconds",
+    "timestamps",
+    "status",
+    "license_info",
+    "unit",
+    "deprecated",
+    "substitute",
+}
+
 
 def _to_unix_seconds(date_str: str, end_of_day: bool = False) -> int:
     """Convert a YYYY-MM-DD date string or integer string to UTC Unix seconds."""
@@ -31,7 +41,7 @@ def _to_unix_seconds(date_str: str, end_of_day: bool = False) -> int:
 
 
 def _extract_country_from_filename(path: Path) -> str:
-    """Extract country code from filenames like cbpf_DE_2019.json or cbpf_de_2019.json."""
+    """Extract country code from filenames like cbpf_de_2019.json."""
     parts = path.stem.split("_")
     if len(parts) >= 2 and len(parts[1]) in {2, 3}:
         return parts[1].upper()
@@ -46,7 +56,7 @@ def _series_to_daily_gwh(
     partner: str,
 ) -> list[dict[str, Any]]:
     """Convert a power series (MW) into daily import and export energy (GWh)."""
-    if len(series_vals) != len(dt_index) or len(dt_index) == 0:
+    if not isinstance(series_vals, list) or len(series_vals) != len(dt_index) or len(dt_index) == 0:
         return []
 
     s = pd.to_numeric(pd.Series(series_vals, index=dt_index), errors="coerce").fillna(0.0)
@@ -71,53 +81,100 @@ def _series_to_daily_gwh(
     return rows
 
 
-def _parse_cbpf_payload(payload: Any, fallback_country: str = "DE") -> pd.DataFrame:
+def _collect_from_container(
+    container: Any,
+    dt_index: pd.DatetimeIndex,
+    day_keys: pd.Index,
+    default_country: str,
+) -> list[dict[str, Any]]:
+    """Extract daily rows from dict or list-of-dicts containers."""
+    rows: list[dict[str, Any]] = []
+
+    if isinstance(container, list):
+        for item in container:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("name") or item.get("country") or item.get("code") or "").strip()
+            vals = item.get("data") if isinstance(item.get("data"), list) else item.get("values")
+            if label and isinstance(vals, list):
+                rows.extend(
+                    _series_to_daily_gwh(
+                        series_vals=vals,
+                        dt_index=dt_index,
+                        day_keys=day_keys,
+                        country=default_country,
+                        partner=label,
+                    )
+                )
+    elif isinstance(container, dict):
+        for key, val in container.items():
+            if key in META_KEYS:
+                continue
+            if isinstance(val, dict):
+                target = str(key).upper()
+                sub_series = val.get("data") if isinstance(val.get("data"), list) else None
+                if sub_series is not None:
+                    label = str(val.get("name") or target)
+                    rows.extend(
+                        _series_to_daily_gwh(
+                            series_vals=sub_series,
+                            dt_index=dt_index,
+                            day_keys=day_keys,
+                            country=default_country,
+                            partner=label,
+                        )
+                    )
+                else:
+                    for neighbor, series_vals in val.items():
+                        if isinstance(series_vals, list):
+                            rows.extend(
+                                _series_to_daily_gwh(
+                                    series_vals=series_vals,
+                                    dt_index=dt_index,
+                                    day_keys=day_keys,
+                                    country=target,
+                                    partner=str(neighbor),
+                                )
+                            )
+            elif isinstance(val, list):
+                rows.extend(
+                    _series_to_daily_gwh(
+                        series_vals=val,
+                        dt_index=dt_index,
+                        day_keys=day_keys,
+                        country=default_country,
+                        partner=str(key),
+                    )
+                )
+
+    return rows
+
+
+def _parse_cbpf_payload(payload: Any, fallback_country: str = "DE") -> tuple[pd.DataFrame, list[str]]:
     """Parse Energy-Charts /cbpf JSON payloads into daily import/export rows."""
     if not isinstance(payload, dict):
-        return pd.DataFrame()
+        return pd.DataFrame(), [f"Payload is {type(payload).__name__}, expected dict"]
 
     timestamps = payload.get("unix_seconds") or payload.get("timestamps") or []
     if not isinstance(timestamps, list) or not timestamps:
-        return pd.DataFrame()
+        return pd.DataFrame(), [f"Missing unix_seconds; keys={list(payload.keys())[:10]}"]
 
     dt_index = pd.to_datetime(timestamps, unit="s", utc=True).tz_convert("Europe/Berlin")
     day_keys = pd.Index(dt_index.tz_localize(None).date)
+    country = fallback_country.upper()
 
-    source = payload.get("countries") if isinstance(payload.get("countries"), dict) else payload
-    if not isinstance(source, dict):
-        return pd.DataFrame()
-
-    skip_keys = {"unix_seconds", "timestamps", "status", "license_info", "unit"}
     rows: list[dict[str, Any]] = []
+    if "countries" in payload and payload["countries"] is not None:
+        rows.extend(_collect_from_container(payload["countries"], dt_index, day_keys, country))
+    if not rows and "data" in payload and payload["data"] is not None:
+        rows.extend(_collect_from_container(payload["data"], dt_index, day_keys, country))
+    if not rows:
+        rows.extend(_collect_from_container(payload, dt_index, day_keys, country))
 
-    for key, val in source.items():
-        if key in skip_keys:
-            continue
-        if isinstance(val, dict):
-            target = str(key).upper()
-            for neighbor, series_vals in val.items():
-                if isinstance(series_vals, list):
-                    rows.extend(
-                        _series_to_daily_gwh(
-                            series_vals=series_vals,
-                            dt_index=dt_index,
-                            day_keys=day_keys,
-                            country=target,
-                            partner=str(neighbor).upper(),
-                        )
-                    )
-        elif isinstance(val, list):
-            rows.extend(
-                _series_to_daily_gwh(
-                    series_vals=val,
-                    dt_index=dt_index,
-                    day_keys=day_keys,
-                    country=fallback_country.upper(),
-                    partner=str(key).upper(),
-                )
-            )
+    if not rows:
+        return pd.DataFrame(), [f"0 series matched; keys={list(payload.keys())[:12]}"]
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), []
 
 
 @st.cache_data(show_spinner="Reading JSON files...")
@@ -141,9 +198,10 @@ def load_json_folder(folder_path_str: str, glob_pattern: str) -> tuple[pd.DataFr
         try:
             with fp.open("r", encoding="utf-8") as f:
                 payload = json.load(f)
-            parsed = _parse_cbpf_payload(payload, fallback_country=_extract_country_from_filename(fp))
+            parsed, diag = _parse_cbpf_payload(payload, fallback_country=_extract_country_from_filename(fp))
             if parsed.empty:
-                notes.append(f"Skipped {fp.name}: no valid flow series found.")
+                detail = "; ".join(diag) if diag else "no valid flow series found"
+                notes.append(f"Skipped {fp.name}: {detail}.")
             else:
                 frames.append(parsed)
         except Exception as exc:
@@ -175,9 +233,9 @@ def fetch_cbpf_fallback(country: str, start_str: str, end_str: str) -> tuple[pd.
             timeout=20,
         )
         resp.raise_for_status()
-        df = _parse_cbpf_payload(resp.json(), fallback_country=country.strip().upper())
+        df, diag = _parse_cbpf_payload(resp.json(), fallback_country=country.strip().upper())
         if df.empty:
-            return pd.DataFrame(), "API response contained no parseable flow series."
+            return pd.DataFrame(), "; ".join(diag) if diag else "API response contained no parseable flow series."
         return df, None
     except Exception as exc:
         return pd.DataFrame(), f"{type(exc).__name__}: {exc}"
