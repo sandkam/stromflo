@@ -367,17 +367,19 @@ def main() -> None:
         api_end = st.text_input("End date (YYYY-MM-DD)", value="2019-01-31")
         use_api_fallback = st.checkbox("Use Energy-Charts API fallback", value=True)
 
+    # --- Insert here: replaces the old load_flow_data / fetch_api_sample / if df.empty block ---
+    api_error: str | None = None
     df = load_flow_data(folder_input, pattern_input)
 
     if df.empty and use_api_fallback:
-        df = fetch_api_sample(api_country, api_start, api_end)
+        df, api_error = fetch_api_sample(api_country, api_start, api_end)
 
     if df.empty:
-        st.warning(
-            f"No valid JSON files found matching `{pattern_input}` in `{folder_input}`, "
-            "and API fallback returned no rows."
-        )
+        st.warning(f"No valid JSON files found matching `{pattern_input}` in `{folder_input}`.")
+        if api_error:
+            st.error(f"API fallback error: {api_error}")
         st.stop()
+    # --- End of replacement block ---
 
     dates = sorted(df["date"].unique())
     max_ref = float(np.maximum(df["import_gwh"], df["export_gwh"]).quantile(0.98))
