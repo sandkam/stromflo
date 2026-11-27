@@ -2,8 +2,7 @@
 
 Design (kept from the original app)
   * One arc per country; arc length = share of the day's gross flow (import + export).
-  * One curved link per border; width = its share of the day's total flow,
-    colour = the larger of import / export.
+  * One ribbon per border; width = its gross flow, colour = the net exporting country.
   * A day slider and auto-play step through the year.
 
 Data: Energy-Charts "cbpf" JSON files, one per country, e.g. json_2019/cbpf_de_2019.json.
@@ -20,9 +19,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-from matplotlib.cm import ScalarMappable
-from matplotlib.colors import Normalize
-from matplotlib.patches import Arc, PathPatch
+from matplotlib.patches import PathPatch, Wedge
 from matplotlib.path import Path as MplPath
 
 st.set_page_config(page_title="Germany electricity flow circle", layout="wide")
@@ -36,7 +33,6 @@ NODES = {
 NAME_TO_CODE = {name.lower(): code for code, name in NODES.items()}
 NAME_TO_CODE["czech republic"] = "CZ"
 GAP_DEG = 2.0
-LINK_WIDTH_PER_SHARE = 60.0  # line width (pt) per 100% share of the day's flow
 TIMEZONE = "Europe/Berlin"
 
 
@@ -96,12 +92,36 @@ def load_flows(folder: str, year: int) -> tuple[pd.DataFrame, list[str]]:
     df["pair"] = ["-".join(sorted(p)) for p in zip(df["country"], df["partner"])]
     df = df.drop_duplicates(["date", "pair"], keep="first")  # A->B and B->A are the same border
     df["gross_gwh"] = df["import_gwh"] + df["export_gwh"]
-    df["max_gwh"] = df[["import_gwh", "export_gwh"]].max(axis=1)
     return df, missing
 
 
 # ------------------------------------------------------------------------- figure
-def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp, max_ref: float) -> plt.Figure:
+RING_INNER, RING_OUTER = 0.955, 1.0
+CENTER = np.zeros(2)
+
+
+def point(cw_deg: float, radius: float) -> np.ndarray:
+    """Point on the circle; angles run clockwise from the top."""
+    theta = np.deg2rad(90.0 - cw_deg)
+    return radius * np.array([np.cos(theta), np.sin(theta)])
+
+
+def ribbon_path(slot_a: tuple[float, float], slot_b: tuple[float, float]) -> MplPath:
+    """Closed chord ribbon: arc along A, curve to B, arc along B, curve back to A."""
+    def arc(s0: float, s1: float) -> list[np.ndarray]:
+        steps = max(2, int(abs(s1 - s0) / 1.5) + 2)
+        return [point(t, RING_INNER) for t in np.linspace(s0, s1, steps)]
+
+    pa, pb = arc(*slot_a), arc(*slot_b)
+    verts = pa + [CENTER, pb[0]] + pb[1:] + [CENTER, pa[0], pa[0]]
+    codes = ([MplPath.MOVETO] + [MplPath.LINETO] * (len(pa) - 1)
+             + [MplPath.CURVE3] * 2 + [MplPath.LINETO] * (len(pb) - 1)
+             + [MplPath.CURVE3] * 2 + [MplPath.CLOSEPOLY])
+    return MplPath(verts, codes)
+
+
+def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp) -> plt.Figure:
+    """Chord diagram: arc length and ribbon width = gross flow (import + export)."""
     gross = {c: 0.0 for c in NODES}
     for r in links.itertuples():
         gross[r.country] += r.gross_gwh
@@ -111,8 +131,8 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp, max_ref: float) 
     fig, ax = plt.subplots(figsize=(7.5, 7.5), dpi=110)
     ax.set_aspect("equal")
     ax.axis("off")
-    ax.set_xlim(-1.35, 1.35)
-    ax.set_ylim(-1.35, 1.35)
+    ax.set_xlim(-1.25, 1.25)
+    ax.set_ylim(-1.25, 1.25)
     ax.set_title(f"Electricity flow circle - {date:%Y-%m-%d}", fontsize=12)
     if total <= 0:
         ax.text(0, 0, "No flow data for this day", ha="center", va="center")
@@ -127,10 +147,11 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp, max_ref: float) 
         arcs[c] = (cursor, cursor + span)
         cursor += span + GAP_DEG
     mid = {c: (a + b) / 2 for c, (a, b) in arcs.items()}
+    color = {c: plt.cm.Paired(i) for i, c in enumerate(NODES)}
 
-    # Attachment point of every link inside its arcs. Ordering partners by clockwise
-    # distance (farthest first) keeps the links of one node from crossing each other.
-    attach = {}
+    # Each link gets a slot inside both of its arcs. Ordering partners by clockwise
+    # distance (farthest first) keeps the ribbons of one node from crossing each other.
+    slots = {}
     for c, (a, b) in arcs.items():
         mine = [(r.partner if r.country == c else r.country, r.gross_gwh)
                 for r in links.itertuples() if c in (r.country, r.partner)]
@@ -139,32 +160,21 @@ def make_circle_figure(links: pd.DataFrame, date: pd.Timestamp, max_ref: float) 
         pos = a
         for partner, w in mine:
             span = (b - a) * w / node_total
-            attach[(c, partner)] = pos + span / 2
+            slots[(c, partner)] = (pos, pos + span)
             pos += span
 
-    def point(cw_deg: float, radius: float) -> np.ndarray:
-        theta = np.deg2rad(90.0 - cw_deg)
-        return radius * np.array([np.cos(theta), np.sin(theta)])
-
-    for i, (c, (a, b)) in enumerate(arcs.items()):
-        ax.add_patch(Arc((0, 0), 2, 2, theta1=90 - b, theta2=90 - a, linewidth=10,
-                         color="#2b2d42" if c == "DE" else plt.cm.tab20(i % 20)))
-        x, y = point(mid[c], 1.15)
+    for c, (a, b) in arcs.items():
+        ax.add_patch(Wedge((0, 0), RING_OUTER, 90 - b, 90 - a, width=RING_OUTER - RING_INNER,
+                           facecolor=color[c][:3] + (0.55,), edgecolor="none"))
+        x, y = point(mid[c], 1.1)
         ax.text(x, y, c, ha="center", va="center", fontsize=10, fontweight="bold")
 
-    cmap = plt.cm.viridis
-    for r in links.sort_values("max_gwh").itertuples():  # strongest links drawn last
-        p1 = point(attach[(r.country, r.partner)], 0.94)
-        p2 = point(attach[(r.partner, r.country)], 0.94)
-        ctrl = 0.12 * (p1 + p2)
-        strength = float(np.clip(r.max_gwh / max_ref, 0.0, 1.0))
-        share = r.gross_gwh / (total / 2.0)  # this border's share of the day's total flow
-        path = MplPath([p1, ctrl, p2], [MplPath.MOVETO, MplPath.CURVE3, MplPath.CURVE3])
-        ax.add_patch(PathPatch(path, facecolor="none", edgecolor=cmap(strength),
-                               linewidth=0.6 + LINK_WIDTH_PER_SHARE * share, alpha=0.75))
-
-    fig.colorbar(ScalarMappable(Normalize(0, max_ref), cmap=cmap), ax=ax, fraction=0.035,
-                 pad=0.02, label="Larger of import / export per day (GWh)")
+    # Ribbon colour = the border's net exporting country (positive = import into `country`).
+    for r in links.sort_values("gross_gwh", ascending=False).itertuples():
+        exporter = r.partner if r.import_gwh >= r.export_gwh else r.country
+        ax.add_patch(PathPatch(ribbon_path(slots[(r.country, r.partner)], slots[(r.partner, r.country)]),
+                               facecolor=color[exporter][:3] + (0.8,),
+                               edgecolor=(0, 0, 0, 0.25), linewidth=0.4))
     return fig
 
 
@@ -176,7 +186,7 @@ def main() -> None:
         st.header("Data & playback")
         year = int(st.number_input("Year", min_value=2000, max_value=2100, value=2019, step=1))
         folder = st.text_input("JSON folder", value=f"json_{year}", key=f"folder_{year}")
-        neighbours = st.checkbox("Include links between neighbours", value=False)
+        neighbours = st.checkbox("Include links between neighbours", value=True)
         st.checkbox("Auto-play", key="playing")
         delay = st.slider("Step delay (s)", 0.05, 1.0, 0.2, 0.05)
 
@@ -188,7 +198,6 @@ def main() -> None:
         st.sidebar.info("Files not found for: " + ", ".join(missing))
 
     links_all = df if neighbours else df[(df["country"] == "DE") | (df["partner"] == "DE")]
-    max_ref = max(float(links_all["max_gwh"].max()), 1e-6)  # fixed scale for the whole year
     dates = np.sort(links_all["date"].unique())
     n = len(dates)
 
@@ -200,12 +209,14 @@ def main() -> None:
 
     date = pd.Timestamp(dates[idx])
     st.subheader(f"{date:%A, %d %B %Y}")
+    st.caption("Arc length and ribbon width show gross flow (import + export). "
+               "Ribbon colour is the net exporting country on that border.")
     day = links_all[links_all["date"] == date]
     de = df[(df["date"] == date) & (df["country"] == "DE")]
 
     col_plot, col_data = st.columns([2, 1])
     with col_plot:
-        fig = make_circle_figure(day, date, max_ref)
+        fig = make_circle_figure(day, date)
         st.pyplot(fig, clear_figure=True)
         plt.close(fig)
 
